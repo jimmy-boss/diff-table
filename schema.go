@@ -48,79 +48,52 @@ func (d *Differ) getTableSchema(db *gorm.DB, dbName string, tableName string) (*
 	return table, nil
 }
 
-// fetchColumns 通过 GORM ColumnTypes + Raw SQL 获取列信息
+// fetchColumns 通过 information_schema.COLUMNS 获取列信息（绕过 GORM Migrator 避免 Doris 不支持 LIMIT ?）
 func (d *Differ) fetchColumns(db *gorm.DB, dbName string, tableName string, table *Table) error {
-	// GORM Migrator 获取基础列信息
-	m := db.Migrator()
-	if !m.HasTable(tableName) {
-		return fmt.Errorf("table %s not found", tableName)
-	}
-
-	columnTypes, err := m.ColumnTypes(tableName)
-	if err != nil {
-		return err
-	}
-
-	for _, ct := range columnTypes {
-		col := Column{
-			Name: ct.Name(),
-		}
-
-		// 数据类型
-		col.DataType = ct.DatabaseTypeName()
-
-		// 是否可为 NULL
-		if nullable, ok := ct.Nullable(); ok {
-			col.IsNull = nullable
-		}
-
-		// 默认值
-		if defaultVal, ok := ct.DefaultValue(); ok && defaultVal != "" {
-			col.Default = &defaultVal
-		}
-
-		table.Columns[col.Name] = col
-	}
-
-	// Raw SQL 补充 Extra 和 Comment（MySQL 通过 information_schema）
-	d.fetchColumnExtras(db, dbName, tableName, table)
-
-	return nil
-}
-
-// fetchColumnExtras 通过 Raw SQL 补充 Extra 和 Comment
-func (d *Differ) fetchColumnExtras(db *gorm.DB, dbName string, tableName string, table *Table) {
 	dbNameVal := dbName
 	if dbNameVal == "" {
 		dbNameVal = db.Migrator().CurrentDatabase()
 	}
 
-	// 查询 information_schema 获取 Extra 和 Comment
-	type columnExtra struct {
-		ColumnName string
-		Extra      string
-		Comment    string
+	// 先校验表是否存在
+	if !db.Migrator().HasTable(tableName) {
+		return fmt.Errorf("table %s not found", tableName)
 	}
 
-	var extras []columnExtra
-	sql := `SELECT COLUMN_NAME, EXTRA, COLUMN_COMMENT
+	type columnRow struct {
+		ColumnName    string
+		DataType      string
+		IsNullable    string
+		ColumnDefault *string
+		Extra         string
+		ColumnComment string
+	}
+
+	var rows []columnRow
+	sql := `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT
 		FROM information_schema.COLUMNS
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION`
 
-	if err := db.Raw(sql, dbNameVal, tableName).Scan(&extras).Error; err != nil {
-		if d.logger != nil {
-			d.logger.Warn("fetchColumnExtras failed, skipping", zap.Error(err))
-		}
-		return
+	if err := db.Raw(sql, dbNameVal, tableName).Scan(&rows).Error; err != nil {
+		return fmt.Errorf("query information_schema.COLUMNS: %w", err)
 	}
 
-	for _, extra := range extras {
-		if col, ok := table.Columns[extra.ColumnName]; ok {
-			col.Extra = extra.Extra
-			col.Comment = extra.Comment
-			table.Columns[extra.ColumnName] = col
+	for _, row := range rows {
+		col := Column{
+			Name:     row.ColumnName,
+			DataType: row.DataType,
+			IsNull:   row.IsNullable == "YES",
+			Extra:    row.Extra,
+			Comment:  row.ColumnComment,
 		}
+		if row.ColumnDefault != nil && *row.ColumnDefault != "" {
+			col.Default = row.ColumnDefault
+		}
+		table.Columns[col.Name] = col
 	}
+
+	return nil
 }
 
 // fetchIndexes 通过 GORM Indexes 获取索引信息
@@ -156,17 +129,23 @@ func (d *Differ) fetchPrimaryKey(db *gorm.DB, tableName string, table *Table) er
 		}
 	}
 
-	// 如果索引中没有标记主键，尝试通过 ColumnTypes 推断
-	m := db.Migrator()
-	columnTypes, err := m.ColumnTypes(tableName)
-	if err != nil {
-		return err
+	// 如果索引中没有标记主键，尝试通过 information_schema 推断
+	dbName := db.Migrator().CurrentDatabase()
+	type pkRow struct {
+		ColumnName string
+	}
+	var rows []pkRow
+	sql := `SELECT COLUMN_NAME
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_KEY = 'PRI'
+		ORDER BY ORDINAL_POSITION`
+
+	if err := db.Raw(sql, dbName, tableName).Scan(&rows).Error; err != nil {
+		return fmt.Errorf("query primary key from information_schema: %w", err)
 	}
 
-	for _, ct := range columnTypes {
-		if isPK, ok := ct.PrimaryKey(); ok && isPK {
-			table.PrimaryKey = append(table.PrimaryKey, ct.Name())
-		}
+	for _, row := range rows {
+		table.PrimaryKey = append(table.PrimaryKey, row.ColumnName)
 	}
 
 	// 回写主键标记到对应索引
